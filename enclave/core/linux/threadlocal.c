@@ -4,6 +4,7 @@
 #include "threadlocal.h"
 #include <openenclave/bits/safecrt.h>
 #include <openenclave/enclave.h>
+#include <openenclave/internal/elf.h>
 #include <openenclave/internal/enclavelibc.h>
 #include <openenclave/internal/globals.h>
 #include <openenclave/internal/raise.h>
@@ -124,7 +125,56 @@
  * calls to __tls_get_addr and to reduce thread-local variable access to simple
  * FS register offsets. To handle dynamically loaded modules we need to
  * implement __tls_get_addr.
- * For complete reference see: Elf Handling for Thread-Local Storage
+ * For complete reference see: Elf Handling for Thread-Local Storage.
+ *
+ * ****************************************************************************
+ * Exported thread-locals and shared-libraries:
+ *
+ * When thread-local variables are exported (via visibility=default), then the
+ * linker does not optimize the access of a thread-local variable to a constant
+ * offset from the FS register. Instead, for each thread-local variable,
+ * another variable is introduced varname@tpoff that contains the offset for
+ * the thread local variable. The offset value for varname@tpoff is expected to
+ * be filled up by the dynamic linker/loader.
+ * Consider,
+ *         __attribute__((visibility=default)) __thread int x;
+ *         int foo() { return x; }
+ *
+ * This results in the following code to access x
+ *     foo:
+ *         ...
+ *         mov %FS:0, %rax            // Fetch the address of the FS segment
+ *         add x@tpoff(%rip), %rax    // Fetch offset for x from the
+ *                                    // relocation entry x@tpoff and add it to
+ *                                    // FS
+ *         mov (%rax), rax            // Fetch value of x
+ *
+ * Each @tpoff variable results in a relocation entry of the type
+ * R_X86_64_TPOFF64. The relocation entry contains enough information to fill
+ * the value of the @tpoff variable.
+ * R_X86_64_TPOFF64 relocation info contains the following fields:
+ *
+ *    r_offset = relative address of the corresponding tpoff variable
+ *    r_info.relocation_type = R_X86_64_TPOFF64
+ *    r_info.symbol = index of symbol in the .dynsym section.
+ *    r_addend = 0
+ *
+ * The value (st_value) of the symbol in the .dynsym section contains the offset
+ * to the thread-local variable from the *start* of the thread-local section.
+ * Thus:
+ *    &x = tls-start + symbol sh_value.
+ *
+ * Since the compiler emits code relative to the end of the section (i.e using
+ * FS), the tpoff is computed via the formula:
+ *     tpoff = FS - (tls-start + sh-value).
+ *
+ * Thus, performing relocations for thread-local variables involves setting the
+ * value of the corresponding tpoff variables to the offset from the FS register
+ * value.
+ *
+ * To avoid looking up symbols within the enclave (symbols are not availabe)
+ * the loader fetches the symbol's sh-value and stores it in the r_addend field
+ * (r_added field is otherwise zero for R_X86_64_TPOFF64).
  */
 static volatile uint64_t _tdata_rva = 0;
 static volatile uint64_t _tdata_size = 0;
@@ -132,6 +182,9 @@ static volatile uint64_t _tdata_align = 1;
 
 static volatile uint64_t _tbss_size = 0;
 static volatile uint64_t _tbss_align = 1;
+
+// Number of thread-local relocation.
+static volatile bool _thread_locals_relocated = false;
 
 /**
  * Get the address of the FS segment given a thread data object.
@@ -227,6 +280,39 @@ oe_result_t oe_thread_local_init(td_t* td)
 
         // Copy the template
         oe_memcpy_s(tls_start, _tdata_size, tdata, _tdata_size);
+
+        // Perform thread-local relocations.
+        if (!_thread_locals_relocated)
+        {
+            // Note: For an enclave, thread-local relocations always set the
+            // value of the tpoff variables to a computed constant value. Hence
+            // this is inherently thread-safe and also can be called multiple
+            // times.
+            const elf64_rela_t* relocs =
+                (const elf64_rela_t*)__oe_get_reloc_base();
+            size_t nrelocs = __oe_get_reloc_size() / sizeof(elf64_rela_t);
+            const uint8_t* baseaddr = (const uint8_t*)__oe_get_enclave_base();
+
+            for (size_t i = 0; i < nrelocs; i++)
+            {
+                const elf64_rela_t* p = &relocs[i];
+
+                // If zero-padded bytes reached
+                if (p->r_offset == 0)
+                    break;
+
+                if (ELF64_R_TYPE(p->r_info) == R_X86_64_TPOFF64)
+                {
+                    // Compute address of tpoff variable
+                    int64_t* tpoff = (int64_t*)(baseaddr + p->r_offset);
+
+                    // Set tpoff to the offset value relative to FS
+                    *tpoff = (tls_start + p->r_addend - fs);
+                }
+            }
+
+            _thread_locals_relocated = true;
+        }
     }
 
     result = OE_OK;
